@@ -1,44 +1,29 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Graph3D from './components/Graph3D';
 import Controls from './components/Controls';
 
-// Helper function to generate a random network
-function generateGraph(N = 60) {
-    const nodes = Array.from({ length: N }, (_, i) => ({
-        id: i,
-        group: Math.floor(Math.random() * 6), // fake genres
-        influence: Math.random()
-    }));
-
-    const links = Array.from({ length: N * 1.5 }, () => {
-        const source = Math.floor(Math.random() * N);
-        let target = Math.floor(Math.random() * N);
-        if (target === source) target = (target + 1) % N;
-        return { source, target, w: Math.random() };
-    });
-
-    return { nodes, links };
-}
-
-function App() {
+export default function App() {
     const [timestep, setTimestep] = useState(0);
-    const [running, setRunning] = useState(false);
-    const [graphData, setGraphData] = useState(generateGraph());
+    const [graphData, setGraphData] = useState({ nodes: [], links: [] });
+    const wsRef = useRef(null);
 
     useEffect(() => {
-        if (!running) return;
+        const ws = new WebSocket("ws://127.0.0.1:8000/ws");
+        wsRef.current = ws;
 
-        const interval = setInterval(() => {
-            setTimestep(t => t + 1);
-            setGraphData(generateGraph()); // regenerate graph each tick
-        }, 800);
+        ws.onmessage = (event) => {
+            const frame = JSON.parse(event.data);
+            setTimestep(frame.t ?? 0);
+            setGraphData({ nodes: frame.nodes ?? [], links: frame.links ?? [] });
+        };
 
-        return () => clearInterval(interval);
-    }, [running]);
+        return () => ws.close();
+    }, []);
 
-    const handleStep = () => {
-        setTimestep(t => t + 1);
-        setGraphData(generateGraph());
+    const send = (obj) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== 1) return;
+        ws.send(JSON.stringify(obj));
     };
 
     return (
@@ -46,12 +31,10 @@ function App() {
             <Graph3D graphData={graphData} />
             <Controls
                 timestep={timestep}
-                onPlay={() => setRunning(true)}
-                onPause={() => setRunning(false)}
-                onStep={handleStep}
+                onPlay={() => send({ type: "play" })}
+                onPause={() => send({ type: "pause" })}
+                onStep={() => send({ type: "step" })}
             />
         </div>
     );
 }
-
-export default App;
