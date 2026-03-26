@@ -1,239 +1,291 @@
 import React, { useMemo } from "react";
 
 /**
- * Simple 2D scatter plot without external chart libs.
- * - points: [{id, x, y, genre}]
- * - history: array of points arrays (for trails), optional
+ * ScatterPlot2D — uses PCA-projected node positions (x/y from export_frame)
+ * instead of raw style vector dimensions. This gives meaningful cluster
+ * separation rather than an arbitrary 2D slice of 8D space.
+ *
+ * Props:
+ *   nodes    — array of node objects from the frame: { id, x, y, group, influence }
+ *   genres   — array of genre labels per artist (parallel to nodes)
+ *   history  — array of past node arrays for trails
  */
 
-function hashHue(n) {
-    // deterministic hue 0..360
-    return ((n * 97) % 360 + 360) % 360;
+const GENRE_NAMES = [
+        "Pop", "Heavy Metal", "Blues", "Ambient",
+        "Folk", "Electronic", "K-pop", "Experimental",
+        "Jazz", "Classical", "Rock", "Traditional World",
+];
+
+function genreColor(id, alpha = 1) {
+    // Evenly spaced hues, distinct saturations to avoid clumping
+    const hue = ((id * 97) % 360 + 360) % 360;
+    return `hsla(${hue}, 78%, 62%, ${alpha})`;
 }
 
-function clamp(v, min, max) {
-    return Math.max(min, Math.min(max, v));
+function genreName(id, totalGenres) {
+    // Last genre = Experimental (noise points)
+    if (id === totalGenres - 1 && totalGenres > 1) return "Experimental";
+    return GENRE_NAMES[id % (GENRE_NAMES.length - 1)];
 }
 
-function isFiniteNumber(v) {
+function isFiniteNum(v) {
     return typeof v === "number" && isFinite(v);
 }
 
-export default function ScatterPlot2D(props) {
-    const pointsRaw = props.points || [];
-    const historyRaw = props.history || [];
+function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+}
 
-    // Clean points so we don't crash on undefined/null/strings
-    const points = useMemo(() => {
-        const out = [];
-        for (let i = 0; i < pointsRaw.length; i++) {
-            const p = pointsRaw[i];
-            if (!p) continue;
+export default function ScatterPlot2D({ nodes = [], genres = [], history = [] }) {
+    const WIDTH  = 820;
+    const HEIGHT = 480;
+    const PAD    = 40;
 
-            const x = Number(p.x);
-            const y = Number(p.y);
-
-            if (!isFiniteNumber(x) || !isFiniteNumber(y)) continue;
-
-            out.push({
-                id: typeof p.id !== "undefined" ? p.id : i,
-                x: x,
-                y: y,
-                genre: typeof p.genre !== "undefined" ? p.genre : null,
-            });
-        }
-        return out;
-    }, [pointsRaw]);
-
-    const memo = useMemo(() => {
-        if (!points || points.length === 0) {
-            return {
-                bounds: { minX: -1, maxX: 1, minY: -1, maxY: 1 },
-                normalized: [],
-            };
+    // Compute bounds from current node positions (PCA x/y)
+    const { bounds, normalized } = useMemo(() => {
+        const valid = nodes.filter(n => isFiniteNum(n.x) && isFiniteNum(n.y));
+        if (valid.length === 0) {
+            return { bounds: { minX: -1, maxX: 1, minY: -1, maxY: 1 }, normalized: [] };
         }
 
-        let minX = points[0].x;
-        let maxX = points[0].x;
-        let minY = points[0].y;
-        let maxY = points[0].y;
-
-        for (let i = 1; i < points.length; i++) {
-            const px = points[i].x;
-            const py = points[i].y;
-
-            if (px < minX) minX = px;
-            if (px > maxX) maxX = px;
-            if (py < minY) minY = py;
-            if (py > maxY) maxY = py;
+        let minX = valid[0].x, maxX = valid[0].x;
+        let minY = valid[0].y, maxY = valid[0].y;
+        for (const n of valid) {
+            if (n.x < minX) minX = n.x;
+            if (n.x > maxX) maxX = n.x;
+            if (n.y < minY) minY = n.y;
+            if (n.y > maxY) maxY = n.y;
         }
 
-        // add padding so points aren't on edges
+        // Add 10% padding around the data
         const spanX = maxX - minX || 1;
         const spanY = maxY - minY || 1;
-        const padX = spanX * 0.08;
-        const padY = spanY * 0.08;
+        minX -= spanX * 0.1; maxX += spanX * 0.1;
+        minY -= spanY * 0.1; maxY += spanY * 0.1;
 
-        minX -= padX;
-        maxX += padX;
-        minY -= padY;
-        maxY += padY;
+        const dX = maxX - minX || 1;
+        const dY = maxY - minY || 1;
 
-        const denomX = maxX - minX || 1;
-        const denomY = maxY - minY || 1;
-
-        const normalized = points.map((p) => ({
-            id: p.id,
-            x: p.x,
-            y: p.y,
-            genre: p.genre,
-            nx: (p.x - minX) / denomX,
-            ny: (p.y - minY) / denomY,
+        const normalized = valid.map(n => ({
+            ...n,
+            nx: (n.x - minX) / dX,
+            ny: (n.y - minY) / dY,
+            genre: genres[n.id] ?? n.group ?? 0,
         }));
 
-        return { bounds: { minX, maxX, minY, maxY }, normalized: normalized };
-    }, [points]);
+        return { bounds: { minX, maxX, minY, maxY }, normalized };
+    }, [nodes, genres]);
 
-    const bounds = memo.bounds;
-    const normalized = memo.normalized;
+    // Convert normalised [0,1] coords to SVG screen coords
+    const toScreen = (nx, ny) => ({
+        sx: PAD + nx * (WIDTH  - PAD * 2),
+        sy: PAD + (1 - ny) * (HEIGHT - PAD * 2),
+    });
 
-    const width = 820;
-    const height = 520;
-    const pad = 22;
+    // Build genre summary for the legend
+    const genreSummary = useMemo(() => {
+        if (!normalized.length) return [];
+        const counts = {};
+        for (const n of normalized) {
+            counts[n.genre] = (counts[n.genre] || 0) + 1;
+        }
+        const totalGenres = Object.keys(counts).length;
+        return Object.entries(counts)
+            .sort((a, b) => b[1] - a[1])
+            .map(([id, count]) => ({
+                id: Number(id),
+                count,
+                name: genreName(Number(id), totalGenres),
+                color: genreColor(Number(id)),
+            }));
+    }, [normalized]);
 
-    const toScreen = (nx, ny) => {
-        const x = pad + nx * (width - pad * 2);
-        const y = pad + (1 - ny) * (height - pad * 2);
-        return { x: x, y: y };
-    };
+    // Build centroid positions for cluster labels
+    const centroids = useMemo(() => {
+        const sums = {};
+        for (const n of normalized) {
+            if (!sums[n.genre]) sums[n.genre] = { sx: 0, sy: 0, count: 0 };
+            const { sx, sy } = toScreen(clamp(n.nx, 0, 1), clamp(n.ny, 0, 1));
+            sums[n.genre].sx    += sx;
+            sums[n.genre].sy    += sy;
+            sums[n.genre].count += 1;
+        }
+        const totalGenres = Object.keys(sums).length;
+        return Object.entries(sums).map(([id, v]) => ({
+            id:    Number(id),
+            sx:    v.sx / v.count,
+            sy:    v.sy / v.count,
+            name:  genreName(Number(id), totalGenres),
+            color: genreColor(Number(id)),
+        }));
+    }, [normalized]);
 
-    // Trails: use a plain object instead of Map for compatibility
+    // Trails — use last 8 history frames, keyed by node id
     const trails = useMemo(() => {
-        if (!historyRaw || historyRaw.length === 0) return [];
+        const frames = history.slice(-8);
+        if (frames.length < 2) return [];
 
-        const byId = {}; // id -> array of {x,y,genre}
-
-        for (let f = 0; f < historyRaw.length; f++) {
-            const frame = historyRaw[f] || [];
-            for (let j = 0; j < frame.length; j++) {
-                const p = frame[j];
-                if (!p) continue;
-
-                const id = typeof p.id !== "undefined" ? p.id : j;
-                const x = Number(p.x);
-                const y = Number(p.y);
-
-                if (!isFiniteNumber(x) || !isFiniteNumber(y)) continue;
-
-                if (!byId[id]) byId[id] = [];
-                byId[id].push({
-                    x: x,
-                    y: y,
-                    genre: typeof p.genre !== "undefined" ? p.genre : null,
-                });
+        // Build per-id position history using node x/y (PCA coords)
+        const byId = {};
+        for (let f = 0; f < frames.length; f++) {
+            const frame = frames[f] || [];
+            for (const n of frame) {
+                if (!isFiniteNum(n.x) || !isFiniteNum(n.y)) continue;
+                if (!byId[n.id]) byId[n.id] = [];
+                byId[n.id].push({ x: n.x, y: n.y, genre: genres[n.id] ?? n.group ?? 0, f });
             }
         }
 
-        const minX = bounds.minX;
-        const maxX = bounds.maxX;
-        const minY = bounds.minY;
-        const maxY = bounds.maxY;
-
-        const denomX = maxX - minX || 1;
-        const denomY = maxY - minY || 1;
-
-        function toNorm(x, y) {
-            return {
-                nx: (x - minX) / denomX,
-                ny: (y - minY) / denomY,
-            };
-        }
+        const { minX, maxX, minY, maxY } = bounds;
+        const dX = maxX - minX || 1;
+        const dY = maxY - minY || 1;
 
         const paths = [];
         for (const id in byId) {
             const pts = byId[id];
-            if (!pts || pts.length === 0) continue;
-
-            let d = "";
-            for (let k = 0; k < pts.length; k++) {
-                const p = pts[k];
-                const nrm = toNorm(p.x, p.y);
-                const sc = toScreen(clamp(nrm.nx, 0, 1), clamp(nrm.ny, 0, 1));
-                d += (k === 0 ? "M " : " L ") + sc.x.toFixed(2) + " " + sc.y.toFixed(2);
+            if (pts.length < 2) continue;
+            const segments = [];
+            for (let k = 1; k < pts.length; k++) {
+                const a = pts[k - 1], b = pts[k];
+                const nxa = (a.x - minX) / dX, nya = (a.y - minY) / dY;
+                const nxb = (b.x - minX) / dX, nyb = (b.y - minY) / dY;
+                const sa = toScreen(clamp(nxa, 0, 1), clamp(nya, 0, 1));
+                const sb = toScreen(clamp(nxb, 0, 1), clamp(nyb, 0, 1));
+                const opacity = (k / pts.length) * 0.22;
+                segments.push({ sa, sb, opacity, genre: b.genre });
             }
-
-            const last = pts[pts.length - 1];
-            const genre = last && last.genre != null ? last.genre : null;
-
-            paths.push({ id: id, d: d, genre: genre });
+            paths.push({ id, segments });
         }
-
         return paths;
-    }, [historyRaw, bounds]);
+    }, [history, bounds, genres]);
 
-    // Safe label formatting
-    const minYText = isFiniteNumber(bounds.minY) ? bounds.minY.toFixed(2) : "0.00";
-    const maxYText = isFiniteNumber(bounds.maxY) ? bounds.maxY.toFixed(2) : "0.00";
-    const minXText = isFiniteNumber(bounds.minX) ? bounds.minX.toFixed(2) : "0.00";
-    const maxXText = isFiniteNumber(bounds.maxX) ? bounds.maxX.toFixed(2) : "0.00";
+    const fmtAxis = v => isFiniteNum(v) ? v.toFixed(1) : "0.0";
 
     return (
-        <svg
-            width="100%"
-            height="100%"
-            viewBox={"0 0 " + width + " " + height}
-            style={{ borderRadius: 14, background: "rgba(0,0,0,0.22)" }}
-        >
-            {/* axes */}
-            <line
-                x1={pad}
-                y1={height - pad}
-                x2={width - pad}
-                y2={height - pad}
-                stroke="rgba(255,255,255,0.18)"
-            />
-            <line
-                x1={pad}
-                y1={pad}
-                x2={pad}
-                y2={height - pad}
-                stroke="rgba(255,255,255,0.18)"
-            />
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, height: "100%" }}>
 
-            {/* labels */}
-            <text x={pad} y={14} fill="rgba(255,255,255,0.6)" fontSize="11">
-                {"y: " + minYText + " to " + maxYText}
-            </text>
-            <text x={width - pad - 180} y={height - 6} fill="rgba(255,255,255,0.6)" fontSize="11">
-                {"x: " + minXText + " to " + maxXText}
-            </text>
+            {/* Legend */}
+            {genreSummary.length > 0 && (
+                <div style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: "6px 14px",
+                    padding: "8px 10px",
+                    borderRadius: 10,
+                    background: "rgba(255,255,255,0.04)",
+                    border: "1px solid rgba(255,255,255,0.07)",
+                }}>
+                    {genreSummary.map(g => (
+                        <div key={g.id} style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            fontSize: 11,
+                            color: "rgba(255,255,255,0.8)",
+                        }}>
+                            <span style={{
+                                width: 8,
+                                height: 8,
+                                borderRadius: "50%",
+                                background: g.color,
+                                flexShrink: 0,
+                                boxShadow: `0 0 5px ${g.color}`,
+                            }} />
+                            <span>{g.name}</span>
+                            <span style={{ opacity: 0.45 }}>({g.count})</span>
+                        </div>
+                    ))}
+                </div>
+            )}
 
-            {/* trails */}
-            {trails.map((t) => {
-                const hue = t.genre != null ? hashHue(t.genre) : 210;
-                return (
-                    <path
-                        key={"trail-" + t.id}
-                        d={t.d}
-                        fill="none"
-                        stroke={"hsla(" + hue + ", 80%, 65%, 0.22)"}
-                        strokeWidth="1.2"
-                    />
-                );
-            })}
+            {/* Plot */}
+            <svg
+                width="100%"
+                height="100%"
+                viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
+                style={{ borderRadius: 12, background: "rgba(0,0,0,0.28)", flex: 1 }}
+            >
+                {/* Subtle grid */}
+                {[0.25, 0.5, 0.75].map(t => {
+                    const gx = PAD + t * (WIDTH  - PAD * 2);
+                    const gy = PAD + t * (HEIGHT - PAD * 2);
+                    return (
+                        <g key={t}>
+                            <line x1={gx} y1={PAD} x2={gx} y2={HEIGHT - PAD}
+                                stroke="rgba(255,255,255,0.04)" strokeDasharray="3 5" />
+                            <line x1={PAD} y1={gy} x2={WIDTH - PAD} y2={gy}
+                                stroke="rgba(255,255,255,0.04)" strokeDasharray="3 5" />
+                        </g>
+                    );
+                })}
 
-            {/* points */}
-            {normalized.map((p) => {
-                const sc = toScreen(clamp(p.nx, 0, 1), clamp(p.ny, 0, 1));
-                const hue = p.genre != null ? hashHue(p.genre) : 210;
+                {/* Axes */}
+                <line x1={PAD} y1={HEIGHT - PAD} x2={WIDTH - PAD} y2={HEIGHT - PAD}
+                    stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
+                <line x1={PAD} y1={PAD} x2={PAD} y2={HEIGHT - PAD}
+                    stroke="rgba(255,255,255,0.18)" strokeWidth="1" />
 
-                return (
-                    <g key={p.id}>
-                        <circle cx={sc.x} cy={sc.y} r="5.0" fill={"hsla(" + hue + ", 85%, 62%, 0.85)"} />
-                        <circle cx={sc.x} cy={sc.y} r="10.5" fill={"hsla(" + hue + ", 85%, 62%, 0.10)"} />
-                    </g>
-                );
-            })}
-        </svg>
+                {/* Axis labels — PCA dimensions, not raw dims */}
+                <text x={PAD + 4} y={16}
+                    fill="rgba(255,255,255,0.35)" fontSize="11" fontFamily="monospace">
+                    PCA 1 · {fmtAxis(bounds.minY)} → {fmtAxis(bounds.maxY)}
+                </text>
+                <text x={WIDTH - PAD} y={HEIGHT - 8}
+                    fill="rgba(255,255,255,0.35)" fontSize="11" fontFamily="monospace"
+                    textAnchor="end">
+                    PCA 2 · {fmtAxis(bounds.minX)} → {fmtAxis(bounds.maxX)}
+                </text>
+
+                {/* Trails */}
+                {trails.map(t =>
+                    t.segments.map((seg, si) => (
+                        <line
+                            key={`trail-${t.id}-${si}`}
+                            x1={seg.sa.sx} y1={seg.sa.sy}
+                            x2={seg.sb.sx} y2={seg.sb.sy}
+                            stroke={genreColor(seg.genre, seg.opacity)}
+                            strokeWidth="1"
+                        />
+                    ))
+                )}
+
+                {/* Cluster centroid labels */}
+                {centroids.map(c => (
+                    <text
+                        key={`label-${c.id}`}
+                        x={c.sx}
+                        y={c.sy - 14}
+                        textAnchor="middle"
+                        fontSize="10"
+                        fontFamily="monospace"
+                        fill={c.color}
+                        opacity="0.7"
+                    >
+                        {c.name}
+                    </text>
+                ))}
+
+                {/* Points */}
+                {normalized.map(n => {
+                    const { sx, sy } = toScreen(clamp(n.nx, 0, 1), clamp(n.ny, 0, 1));
+                    const color = genreColor(n.genre);
+                    // Size by influence so bridge artists are visually prominent
+                    const r = 4.5 + (n.influence || 0) * 4;
+                    return (
+                        <g key={n.id}>
+                            <circle cx={sx} cy={sy} r={r + 5}
+                                fill={genreColor(n.genre, 0.06)} />
+                            <circle cx={sx} cy={sy} r={r}
+                                fill={color} />
+                            <circle cx={sx} cy={sy} r={r}
+                                fill="none"
+                                stroke={genreColor(n.genre, 0.45)}
+                                strokeWidth="0.8" />
+                        </g>
+                    );
+                })}
+            </svg>
+        </div>
     );
 }
