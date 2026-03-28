@@ -1,137 +1,131 @@
-# Music Genre Evolution Simulation
+# Music Genre Evolution Simulator
 
-**CS 4632 – Modeling and Simulation (Milestone 2)**
-
-A real-time simulation of music genre evolution using network dynamics and influence-based style updates. Artists are modeled as nodes in an influence network, and genre clusters emerge over time through local interactions.
+A real-time simulation of music genre evolution using network dynamics and influence-based style updates. Artists are modeled as nodes in a small-world influence network, and genre clusters emerge organically through local interactions — no genres are predefined or hardcoded.
 
 ---
 
-## Project Status
+## How It Works
 
-### Implemented
+Each artist is a point in an 8-dimensional **style space** where every dimension represents an abstract musical attribute (energy, tempo, harmonic complexity, etc.). At each tick, "artists" are pulled toward their neighbors' styles through a weighted influence equation:
 
-- FastAPI backend with WebSocket communication
-- Simulation engine with:
-  - Artist style vectors
-  - Influence network
-  - Iterative update mechanism
-- React + Vite frontend
-- 3D force-directed network visualization
-- 2D style projection plot
-- Real-time Play / Pause / Step controls
-- Adjustable simulation parameters
-
-### Still To Come
-
-- Formal clustering algorithm (e.g., K-means)
-- Data export (CSV / JSON)
-- Additional network models
-- Performance improvements for large simulations
-- Style changes to improve user interface
-
-### Changes from Proposal
-
-- Switched from REST to WebSocket architecture for real-time updates
-- Added interactive 3D visualization layer
-- Separated frontend and backend services
-
----
-
-## Installation
-
-### Backend (FastAPI)
-
-```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate   # Windows
-pip install -r requirements.txt
-python -m uvicorn main:app --reload --port 8000
+```
+X_i(t+1) = (1 - α_i) · X_i(t) + α_i · Σ w_ij · X_j(t) + noise
 ```
 
-Backend runs at: `http://127.0.0.1:8000`
+- **α_i** — artist susceptibility to influence (higher = more easily swayed)
+- **w_ij** — normalized influence weight from artist j to artist i
+- **noise** — random creative jump with probability p, magnitude σ
 
-WebSocket endpoint: `ws://127.0.0.1:8000/ws`
+Artists that cluster together in style space are automatically grouped into genres using **DBSCAN** (Density-Based Spatial Clustering). The network is a **Watts-Strogatz small-world graph** with configurable average degree and rewiring probability, which creates the "shortcuts" between distant artists that mimic viral cultural moments.
 
-### Frontend (React + Vite)
+---
 
-```bash
-cd music-react
-npm install
-npm run dev
+## Features
+
+- Real-time simulation with Play / Pause / Step controls
+- 2D style projection using Principal Component Analysis — shows the two directions of maximum variance in style space
+- Genre cluster detection via **DBSCAN** — no fixed number of genres required
+- **Influence Leaderboard** — ranks artists by betweenness centrality (bridge artists between genres)
+- Fully parameterized — all simulation variables adjustable from the UI
+- Parameter validation with descriptive error messages
+- Automated data collection — metrics logged every tick
+- **CSV and JSON export** of full run logs with timestamps
+- Automated full-run API endpoint for batch documentation
+- Info modals on every parameter explaining the math behind it
+- Responsive layout — works on any screen size
+
+---
+
+## Project Structure
+
+```
+Genre-Evolution-Simulator/
+├── backend/
+│   ├── main.py              # FastAPI app — REST + WebSocket endpoints
+│   ├── requirements.txt
+│   └── sim/
+│       ├── engine.py        # Core simulation logic
+│       └── config.py        # SimConfig dataclass with all defaults
+└── music-react/
+    ├── src/
+    │   ├── App.jsx           # Main UI — state, controls, layout
+    │   └── components/
+│       ├── ScatterPlot2D.jsx # PCA scatter plot with genre trails
+    │       └── GenreStats.jsx    # Genre cluster bars + influence leaderboard
+    └── index.css
 ```
 
-Frontend runs at: `http://localhost:5173`
+---
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Artists (N) | 50 | Number of artist nodes. More artists = more stable minority genres |
+| Style Dimensions (d) | 3 | Dimensionality of style space. Higher = harder to converge |
+| Avg Degree (k) | 4 | Average network connections per artist. Higher = faster diffusion |
+| Innovation Prob (p) | 0.03 | Probability of a random creative jump per tick |
+| Innovation Noise (σ) | 0.04 | Magnitude of creative jumps when they occur |
+| Alpha Decay | 0.3 | Reduces susceptibility for well-connected artists |
+| Seed | 42 | Random seed for full reproducibility |
+| Step (ms) | 400 | Display speed — does not affect simulation math |
+
+### Parameter Regimes
+
+| Setting | Behavior |
+|---------|----------|
+| High alpha decay, low p | Slow convergence, genres persist longer |
+| Low alpha decay, high p | Rapid convergence, one genre dominates quickly |
+| High σ (0.1–0.3) | Genres fragment and recombine frequently |
+| High N (150+) | Multiple stable genres coexist longer |
 
 ---
 
-## Usage
+## Data Collection
 
-1. Start the backend
-2. Start the frontend
-3. Open your browser at `http://localhost:5173`
-4. Use the controls:
+Every simulation tick automatically records:
 
-| Control | Description |
-|--------|-------------|
-| **Step** | Advance one timestep |
-| **Run** | Start continuous simulation |
-| **Stop** | Pause simulation |
-| **Re-Init** | Reset with new parameters |
+| Field | Description |
+|-------|-------------|
+| `timestamp` | UTC wall-clock time of the recording |
+| `tick` | Simulation step number |
+| `unique_genres` | Number of active genre clusters |
+| `largest_genre_n` | Artist count in the dominant genre |
+| `mean_style_spread` | Average standard deviation across style dimensions |
+| `mean_alpha` | Average artist susceptibility |
 
-### Adjustable Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| Number of Artists | Size of the simulation population |
-| Style Dimensions | Dimensionality of the style vector space |
-| Influence Rate (alpha) | How strongly artists pull toward neighbors |
-| Noise | Random drift / innovation probability |
-| Network Connectivity | Average degree of the influence network |
-| Random Seed | Reproducibility control |
+Export the current run at any time via `http://127.0.0.1:8000/api/export/csv`.
 
 ---
 
-## Architecture Overview
+## Changes from Original Proposal
 
-### Backend
+| Original | Current | Reason |
+|----------|---------|--------|
+| K-means clustering | DBSCAN | DBSCAN requires no fixed genre count — genres emerge naturally |
+| WebSocket-only architecture | REST + WebSocket | REST endpoints enable automated batch runs for data collection |
+| 3D force-directed network | PCA 2D scatter plot | PCA projection better shows style-space clustering and genre drift |
+| No data export | CSV + JSON export with timestamps | Required for systematic run documentation |
+| Global `np.random` calls | Seeded `np.random.default_rng` | Full reproducibility — same seed always produces identical results |
 
-- **`SimulationEngine`** – updates artist styles and network state
-- **`/ws` WebSocket endpoint** – broadcasts simulation frames in real time
-- **Parameter update handling** – live parameter injection mid-simulation
+---
+
+## Architecture
+
+### Backend (`engine.py`)
+- `SimulationEngine` — manages artist styles, network, clustering, and metrics
+- `_cluster_labels()` — DBSCAN genre detection, runs every 10 ticks
+- `_compute_betweenness()` — betweenness centrality for influence ranking, runs every 50 ticks
+- `export_frame()` — PCA projection + node/link data for the frontend
+- `export_run_log()` — returns timestamped per-step metrics for CSV/JSON export
 
 ### Frontend
-
-| File | Role |
-|------|------|
-| `App.jsx` | State management + WebSocket control |
-| `Graph3D.jsx` | 3D force-directed influence network |
-| `ScatterPlot2D.jsx` | 2D style-space projection with genre trails |
-
-### Design Principles
-
-- Simulation logic fully separated from visualization
-- Event-driven communication via WebSockets
-- Clear mapping to UML components: Engine, Network, Visualization Layer
+- `App.jsx` — parameter state, validation, API calls, responsive layout
+- `ScatterPlot2D.jsx` — PCA scatter plot with genre color legend, cluster labels, movement trails, and influence-scaled dot sizes
+- `GenreStats.jsx` — genre cluster bar chart and betweenness centrality leaderboard
 
 ---
 
-## Expected Behavior
+## Summary
 
-- **Nodes** represent individual artists
-- **Edges** represent influence relationships between artists
-- **Styles** evolve each timestep based on neighbor influence and random noise
-- **Clusters** visually emerge as genre groupings in both the 3D network and 2D scatter plot
-- **Parameter tuning** produces qualitatively different outcomes:
-
-| Parameter Regime | Observed Behavior |
-|-----------------|-------------------|
-| High alpha, low noise | Rapid convergence to one genre |
-| Low alpha, high noise | Fragmentation, no stable clusters |
-| Balanced alpha + noise | Stable subgenres emerge and persist |
-
----
-
-## 📌 Summary
-
-This project models cultural evolution as an emergent process driven by local interactions within a dynamic network. It integrates computational modeling, real-time communication, and interactive visualization to explore how genres form and evolve without centralized control — a direct implementation of self-organization principles from complex systems theory.
+This project models cultural evolution as an emergent process driven by local interactions within a dynamic network. It integrates computational modeling, real-time visualization, and systematic data collection to explore how genres form, compete, and collapse without centralized control — a direct implementation of self-organization principles from complex systems theory.
