@@ -28,13 +28,11 @@ app.add_middleware(
 
 engine = SimulationEngine(SimConfig())
 clients: set[WebSocket] = set()
-
-# Master index of all completed runs — used for M3 run summary table
 run_index: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
-# Shared models
+# Models
 # ---------------------------------------------------------------------------
 
 class InitParams(BaseModel):
@@ -48,9 +46,8 @@ class InitParams(BaseModel):
 
 
 class RunParams(BaseModel):
-    """Parameters for a fully automated single run (for M3 documentation)."""
-    run_id:      str   = Field(...,  description="Human-readable run ID, e.g. 'run_001'")
-    purpose:     str   = Field("",  description="Short description, e.g. 'Baseline'")
+    run_id:      str   = Field(...,  description="e.g. 'run_001'")
+    purpose:     str   = Field("",  description="e.g. 'Baseline'")
     steps:       int   = Field(200, ge=1,   le=5000)
     N:           int   = Field(120,  ge=5,   le=500)
     d:           int   = Field(8,    ge=2,   le=20)
@@ -66,7 +63,6 @@ class RunParams(BaseModel):
 # ---------------------------------------------------------------------------
 
 def build_frame(eng: SimulationEngine) -> dict:
-    """Full frame for the REST/interactive API."""
     base = eng.export_frame()
     base["styles"] = eng.X.tolist()
     base["genres"] = eng.labels.tolist()
@@ -74,14 +70,22 @@ def build_frame(eng: SimulationEngine) -> dict:
     return base
 
 
-def log_to_csv(run_log: list[dict]) -> str:
-    """Serialise a run log to a CSV string."""
-    if not run_log:
+def log_to_csv(rows: list[dict]) -> str:
+    if not rows:
         return ""
+    # Collect all possible keys across all rows (per-genre counts vary)
+    all_keys: list[str] = []
+    seen = set()
+    for row in rows:
+        for k in row:
+            if k not in seen:
+                all_keys.append(k)
+                seen.add(k)
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=run_log[0].keys())
+    writer = csv.DictWriter(output, fieldnames=all_keys, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(run_log)
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in all_keys})
     return output.getvalue()
 
 
@@ -117,46 +121,57 @@ def api_step():
 
 
 # ---------------------------------------------------------------------------
-# /api/export  — download current run data as CSV  (M3 data collection)
+# Export endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/api/export/csv")
-def export_csv():
+def export_timeseries_csv():
     """
-    Returns the current engine's run log as a downloadable CSV file.
-    Call this after running the simulation to get your M3 data file.
-    Each row = one simulation step with metrics:
-        tick, unique_genres, largest_genre_n, mean_style_spread, mean_alpha
+    Download the time-series run log as CSV.
+    One row per tick. Columns: timestamp, tick, unique_genres,
+    largest_genre_n, mean_style_spread, network_utilization,
+    innovations_this_tick, genre_transitions_this_tick,
+    total_innovations, total_genre_transitions, per-genre counts, etc.
     """
-    run_log = engine.export_run_log()
-    if not run_log:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "No data yet — run at least one step first."}
-        )
-
-    csv_content = log_to_csv(run_log)
+    rows = engine.export_run_log()
+    if not rows:
+        return JSONResponse(status_code=400, content={"error": "No data yet."})
     return StreamingResponse(
-        io.StringIO(csv_content),
+        io.StringIO(log_to_csv(rows)),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=run_export.csv"},
+        headers={"Content-Disposition": "attachment; filename=timeseries.csv"},
     )
 
 
-@app.get("/api/export/json")
-def export_json():
+@app.get("/api/export/events/csv")
+def export_events_csv():
     """
-    Returns the current run log as JSON, including the config used.
-    Useful for embedding a data sample in your M3 report.
+    Download the event log as CSV.
+    One row per discrete event: innovations, genre transitions,
+    genre absorptions, genre emergences.
+    Each row has: timestamp, tick, event_type, artist_id, description.
     """
-    run_log = engine.export_run_log()
-    if not run_log:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "No data yet — run at least one step first."}
-        )
+    rows = engine.export_event_log()
+    if not rows:
+        return JSONResponse(status_code=400, content={"error": "No events yet."})
+    return StreamingResponse(
+        io.StringIO(log_to_csv(rows)),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=events.csv"},
+    )
 
-    payload = {
+
+@app.get("/api/export/summary")
+def export_summary():
+    """
+    Returns aggregate summary statistics for the current run:
+    averages, max/min observations, total counts, throughput rates,
+    and event type breakdown.
+    """
+    summary = engine.export_summary()
+    if not summary:
+        return JSONResponse(status_code=400, content={"error": "No data yet."})
+    return JSONResponse(content={
         "config": {
             "N":           engine.cfg.N,
             "d":           engine.cfg.d,
@@ -166,38 +181,41 @@ def export_json():
             "alpha_decay": engine.cfg.alpha_decay,
             "seed":        engine.cfg.seed,
         },
-        "steps_recorded": len(run_log),
-        "run_log": run_log,
-    }
-    return JSONResponse(content=payload)
+        "summary": summary,
+    })
+
+
+@app.get("/api/export/json")
+def export_json():
+    """Full run log as JSON including config."""
+    rows = engine.export_run_log()
+    if not rows:
+        return JSONResponse(status_code=400, content={"error": "No data yet."})
+    return JSONResponse(content={
+        "config": {
+            "N":           engine.cfg.N,
+            "d":           engine.cfg.d,
+            "k":           engine.cfg.k,
+            "p":           engine.cfg.p,
+            "sigma":       engine.cfg.sigma,
+            "alpha_decay": engine.cfg.alpha_decay,
+            "seed":        engine.cfg.seed,
+        },
+        "steps_recorded": len(rows),
+        "run_log": rows,
+    })
 
 
 # ---------------------------------------------------------------------------
-# /api/run  — automated full run  (M3 10-run documentation)
+# Automated run endpoint
 # ---------------------------------------------------------------------------
 
 @app.post("/api/run")
 def api_run(params: RunParams):
     """
     Executes a complete simulation run in one call.
-
-    Use this to produce your M3 run table. Example curl:
-
-        curl -X POST http://127.0.0.1:8000/api/run \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "run_id": "run_001",
-            "purpose": "Baseline",
-            "steps": 200,
-            "N": 120, "d": 8, "k": 8,
-            "p": 0.03, "sigma": 0.04,
-            "alpha_decay": 0.3, "seed": 42
-          }'
-
-    Returns:
-        - run metadata (id, purpose, duration, final genre count)
-        - full CSV of per-step metrics as a string  (save to run_XXX.csv)
-        - final frame snapshot
+    Returns summary stats, time-series CSV, event CSV, and final frame.
+    Use this to produce your M3 run table.
     """
     global engine
 
@@ -217,15 +235,13 @@ def api_run(params: RunParams):
         engine.step()
     duration_s = time.perf_counter() - start_time
 
-    run_log  = engine.export_run_log()
-    csv_data = log_to_csv(run_log)
+    summary    = engine.export_summary()
+    timeseries = log_to_csv(engine.export_run_log())
+    events     = log_to_csv(engine.export_event_log())
 
-    # Final-step summary stats
-    final = run_log[-1] if run_log else {}
-
-    summary = {
-        "run_id":             params.run_id,
-        "purpose":            params.purpose,
+    run_summary = {
+        "run_id":          params.run_id,
+        "purpose":         params.purpose,
         "parameters": {
             "N":           params.N,
             "d":           params.d,
@@ -235,36 +251,29 @@ def api_run(params: RunParams):
             "alpha_decay": params.alpha_decay,
             "seed":        params.seed,
         },
-        "steps":              params.steps,
-        "duration_s":         round(duration_s, 3),
-        "final_unique_genres":   final.get("unique_genres"),
-        "final_style_spread":    final.get("mean_style_spread"),
-        "final_largest_genre_n": final.get("largest_genre_n"),
+        "steps":           params.steps,
+        "duration_s":      round(duration_s, 3),
+        **summary,
     }
 
-    # Add to master run index
-    run_index.append(summary)
-
-    frame = build_frame(engine)
+    run_index.append(run_summary)
 
     return {
-        "summary": summary,
-        "csv":     csv_data,     # save this as run_XXX.csv for your report
-        "frame":   frame,
+        "summary":    run_summary,
+        "timeseries": timeseries,   # save as run_XXX_timeseries.csv
+        "events":     events,        # save as run_XXX_events.csv
+        "frame":      build_frame(engine),
     }
 
 
 @app.get("/api/run/index")
 def get_run_index():
-    """
-    Returns a summary table of every /api/run call made this session.
-    Use this to build your M3 run summary table.
-    """
+    """Summary table of every /api/run call this session."""
     return {"runs": run_index, "total": len(run_index)}
 
 
 # ---------------------------------------------------------------------------
-# WebSocket (kept for compatibility)
+# WebSocket
 # ---------------------------------------------------------------------------
 
 async def broadcast(payload: dict):
@@ -282,10 +291,8 @@ async def broadcast(payload: dict):
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     clients.add(ws)
-
     running = False
     tick_ms = 200
-
     await ws.send_json(engine.export_frame())
 
     async def sim_loop():
@@ -299,7 +306,6 @@ async def ws_endpoint(ws: WebSocket):
                 await asyncio.sleep(0.05)
 
     loop_task = asyncio.create_task(sim_loop())
-
     try:
         while True:
             msg = await ws.receive_json()
