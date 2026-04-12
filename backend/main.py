@@ -57,6 +57,18 @@ class RunParams(BaseModel):
     alpha_decay: float = Field(0.3,  ge=0.0, le=1.0)
     seed:        int   = 42
 
+class SensitivityParams(BaseModel):
+    parameter:   str   = Field(..., description="Parameter to vary: 'p', 'sigma', 'k', 'N', 'alpha_decay'")
+    values:      list[float] = Field(..., description="List of values to test")
+    steps:       int   = Field(200, ge=1, le=5000)
+    N:           int   = Field(50,  ge=5, le=500)
+    d:           int   = Field(3,   ge=2, le=20)
+    k:           int   = Field(4,   ge=1, le=50)
+    p:           float = Field(0.03, ge=0.0, le=1.0)
+    sigma:       float = Field(0.04, ge=0.0, le=1.0)
+    alpha_decay: float = Field(0.3,  ge=0.0, le=1.0)
+    seed:        int   = 42
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -123,6 +135,59 @@ def api_step():
 # ---------------------------------------------------------------------------
 # Export endpoints
 # ---------------------------------------------------------------------------
+
+
+@app.post("/api/sensitivity")
+def api_sensitivity(params: SensitivityParams):
+    """
+    Runs the simulation once per value in params.values,
+    varying only the specified parameter and holding all others constant.
+    Returns a summary row per run for easy comparison.
+    """
+    global engine
+    results = []
+
+    for val in params.values:
+        cfg_kwargs = {
+            "N":           params.N,
+            "d":           params.d,
+            "k":           min(params.k, params.N - 1),
+            "p":           params.p,
+            "sigma":       params.sigma,
+            "alpha_decay": params.alpha_decay,
+            "seed":        params.seed,
+        }
+
+        if params.parameter in ("k", "N", "d"):
+            cfg_kwargs[params.parameter] = int(val)
+        else:
+            cfg_kwargs[params.parameter] = val
+
+        if params.parameter == "k":
+            cfg_kwargs["k"] = min(cfg_kwargs["k"], cfg_kwargs["N"] - 1)
+
+        cfg = SimConfig(**cfg_kwargs)
+        engine = SimulationEngine(cfg)
+
+        start_time = time.perf_counter()
+        for _ in range(params.steps):
+            engine.step()
+        duration_s = time.perf_counter() - start_time
+
+        summary = engine.export_summary()
+        results.append({
+            "parameter":       params.parameter,
+            "value":           val,
+            "duration_s":      round(duration_s, 3),
+            "final_genres":    summary.get("final_unique_genres"),
+            "peak_dom_tick":   summary.get("peak_dominance_tick"),
+            "final_spread":    summary.get("final_mean_style_spread"),
+            "avg_spread":      summary.get("avg_style_spread"),
+            "innov_rate":      summary.get("innovation_rate_per_tick"),
+            "transition_rate": summary.get("transition_rate_per_tick"),
+        })
+
+    return {"parameter": params.parameter, "results": results}
 
 @app.get("/api/export/csv")
 def export_timeseries_csv():
