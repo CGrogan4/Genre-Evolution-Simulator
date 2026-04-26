@@ -5,6 +5,35 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN
 from .config import SimConfig
 
+# ---------------------------------------------------------------------------
+# Artist type constants
+# ---------------------------------------------------------------------------
+ARTIST_TYPE_TASTEMAKER = 0   # high influence, low susceptibility — leads trends
+ARTIST_TYPE_MAINSTREAM = 1   # average both — baseline behaviour
+ARTIST_TYPE_NICHE      = 2   # low influence, high susceptibility — follows trends
+
+# Proportion of each type in the population (must sum to 1.0)
+_TYPE_PROPORTIONS = {
+    ARTIST_TYPE_TASTEMAKER: 0.15,
+    ARTIST_TYPE_MAINSTREAM: 0.60,
+    ARTIST_TYPE_NICHE:      0.25,
+}
+
+# Alpha (susceptibility) bounds per type  [min, max]
+_ALPHA_BOUNDS = {
+    ARTIST_TYPE_TASTEMAKER: (0.05, 0.20),   # low susceptibility — slow to change
+    ARTIST_TYPE_MAINSTREAM: (0.15, 0.50),   # medium susceptibility
+    ARTIST_TYPE_NICHE:      (0.35, 0.70),   # high susceptibility — follows trends
+}
+
+# Outgoing influence weight scalar per type
+# Applied as a multiplier to the raw random edge weights before normalisation
+_INFLUENCE_SCALAR = {
+    ARTIST_TYPE_TASTEMAKER: 2.5,   # tastemakers punch above their weight
+    ARTIST_TYPE_MAINSTREAM: 1.0,   # baseline
+    ARTIST_TYPE_NICHE:      0.4,   # niche artists have weak outgoing influence
+}
+
 
 class SimulationEngine:
 
@@ -21,9 +50,13 @@ class SimulationEngine:
         # Styles in [0, 1]^d
         self.X = self.rng.random((cfg.N, cfg.d)).astype(np.float32)
 
-        # Susceptibility alpha_i ~ Beta(2,5) scaled to [0.05, 0.6]
-        a = self.rng.beta(2, 5, size=cfg.N).astype(np.float32)
-        self.alpha = (0.05 + 0.55 * a).astype(np.float32)
+        # ------------------------------------------------------------------
+        # Artist heterogeneity — assign each artist a type
+        # ------------------------------------------------------------------
+        self.artist_types = self._assign_artist_types(cfg.N)
+
+        # Susceptibility alpha_i drawn from type-specific range
+        self.alpha = self._init_alpha_by_type()
 
         # Decay alpha toward 0 as degree centrality increases
         deg_centrality = np.array(
@@ -31,14 +64,17 @@ class SimulationEngine:
             dtype=np.float32,
         )
         self.alpha = np.clip(
-            self.alpha - cfg.alpha_decay * deg_centrality, 0.05, 0.6
+            self.alpha - cfg.alpha_decay * deg_centrality, 0.02, 0.75
         )
 
         # Weight matrix W[i,j] = normalised influence of j on i
+        # Tastemakers get higher raw weights, niche artists get lower
         self.w = {i: {} for i in range(cfg.N)}
         for i in range(cfg.N):
             for j in self.G.neighbors(i):
-                self.w[i][j] = float(self.rng.random())
+                base_weight = float(self.rng.random())
+                type_scalar = _INFLUENCE_SCALAR[int(self.artist_types[j])]
+                self.w[i][j] = base_weight * type_scalar
         self._normalize_weights()
 
         # Dense W matrix for vectorised step
@@ -64,22 +100,42 @@ class SimulationEngine:
         # ------------------------------------------------------------------
         # Data collection
         # ------------------------------------------------------------------
-
-        # Time-series log — one entry per tick
         self.run_log: list[dict] = []
-
-        # Event log — one entry per discrete event detected
         self.event_log: list[dict] = []
-
-        # Track previous genre labels so we can detect transitions
         self._prev_labels = self.labels.copy()
-
-        # Track previous innovation count for throughput
         self._total_innovations = 0
         self._total_genre_transitions = 0
 
-        # Record tick-0 snapshot
         self.run_log.append(self._collect_metrics(innovations_this_tick=0))
+
+    # ------------------------------------------------------------------
+    # Artist heterogeneity helpers
+    # ------------------------------------------------------------------
+
+    def _assign_artist_types(self, N: int) -> np.ndarray:
+        n_tastemaker = max(1, round(N * _TYPE_PROPORTIONS[ARTIST_TYPE_TASTEMAKER]))
+        n_niche      = max(1, round(N * _TYPE_PROPORTIONS[ARTIST_TYPE_NICHE]))
+        n_mainstream = N - n_tastemaker - n_niche
+
+        types = np.array(
+            [ARTIST_TYPE_TASTEMAKER] * n_tastemaker
+            + [ARTIST_TYPE_MAINSTREAM] * n_mainstream
+            + [ARTIST_TYPE_NICHE] * n_niche,
+            dtype=np.int8,
+        )
+        self.rng.shuffle(types)
+        return types
+
+    def _init_alpha_by_type(self) -> np.ndarray:
+        alpha = np.empty(self.cfg.N, dtype=np.float32)
+        for artist_type, (lo, hi) in _ALPHA_BOUNDS.items():
+            mask = self.artist_types == artist_type
+            n = int(mask.sum())
+            if n > 0:
+                alpha[mask] = (
+                    self.rng.random(n).astype(np.float32) * (hi - lo) + lo
+                )
+        return alpha
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -115,7 +171,6 @@ class SimulationEngine:
         db = DBSCAN(eps=eps, min_samples=3).fit(self.X)
         labels = db.labels_.copy()
 
-        # All noise points share one "Experimental" label
         if np.any(labels == -1):
             core_max = int(labels[labels != -1].max()) if np.any(labels != -1) else -1
             labels[labels == -1] = core_max + 1
@@ -130,7 +185,6 @@ class SimulationEngine:
     # ------------------------------------------------------------------
 
     def _per_genre_counts(self) -> dict:
-        """Artist count per genre label — entity counts and statuses."""
         counts = {}
         for label in self.labels:
             key = f"genre_{int(label)}_count"
@@ -138,11 +192,6 @@ class SimulationEngine:
         return counts
 
     def _network_utilization(self, W_hom: np.ndarray) -> float:
-        """
-        Fraction of influence edges that are meaningfully active (weight > 0.01).
-        Analogous to resource utilization — how much of the network is
-        actively transmitting influence this tick.
-        """
         active = float(np.sum(W_hom > 0.01))
         total  = float(W_hom.size)
         return round(active / total, 5) if total > 0 else 0.0
@@ -154,23 +203,15 @@ class SimulationEngine:
         genre_transitions: int = 0,
         W_hom: np.ndarray | None = None,
     ) -> dict:
-        """
-        TIME-SERIES snapshot — one row per tick in the run log.
-        Covers: system state, entity counts, utilization, throughput.
-        """
         unique_genres  = int(len(np.unique(self.labels)))
         genre_counts   = np.bincount(self.labels)
         largest_genre  = int(genre_counts.max())
         smallest_genre = int(genre_counts.min())
 
-        # Style spread = how spread out artists are (analogous to queue depth —
-        # high spread means artists are dispersed, low = converging)
         mean_spread = float(np.mean(np.std(self.X, axis=0)))
         max_spread  = float(np.max(np.std(self.X, axis=0)))
         min_spread  = float(np.min(np.std(self.X, axis=0)))
 
-        # Mean pairwise distance — how far apart artists are on average
-        # Expensive for large N so sample if N > 100
         N = self.cfg.N
         if N <= 100:
             dists = np.linalg.norm(
@@ -183,12 +224,21 @@ class SimulationEngine:
             dists = np.linalg.norm(sample[:, None, :] - sample[None, :, :], axis=-1)
             mean_pairwise_dist = float(np.mean(dists))
 
+        type_alpha = {}
+        for t_id, t_name in [
+            (ARTIST_TYPE_TASTEMAKER, "tastemaker"),
+            (ARTIST_TYPE_MAINSTREAM, "mainstream"),
+            (ARTIST_TYPE_NICHE,      "niche"),
+        ]:
+            mask = self.artist_types == t_id
+            if mask.any():
+                type_alpha[f"mean_alpha_{t_name}"] = round(
+                    float(np.mean(self.alpha[mask])), 5
+                )
+
         row = {
-            # --- Identity ---
             "timestamp":             self._now(),
             "tick":                  self.t,
-
-            # --- System state (time-series) ---
             "unique_genres":         unique_genres,
             "largest_genre_n":       largest_genre,
             "smallest_genre_n":      smallest_genre,
@@ -196,65 +246,60 @@ class SimulationEngine:
             "max_style_spread":      round(max_spread,   5),
             "min_style_spread":      round(min_spread,   5),
             "mean_pairwise_dist":    round(mean_pairwise_dist, 5),
-
-            # --- Resource utilization ---
             "network_utilization":   network_utilization,
             "mean_alpha":            round(float(np.mean(self.alpha)), 5),
             "mean_influence_weight": round(float(np.mean(list(
                 v for nbrs in self.w.values() for v in nbrs.values()
             ))), 5),
-
-            # --- Entity counts per genre (status tracking) ---
+            **type_alpha,
             **self._per_genre_counts(),
-
-            # --- Throughput / event counts this tick ---
-            "innovations_this_tick":    innovations_this_tick,
+            "innovations_this_tick":       innovations_this_tick,
             "genre_transitions_this_tick": genre_transitions,
-
-            # --- Cumulative throughput ---
-            "total_innovations":        self._total_innovations,
-            "total_genre_transitions":  self._total_genre_transitions,
+            "total_innovations":           self._total_innovations,
+            "total_genre_transitions":     self._total_genre_transitions,
         }
         return row
 
     def _detect_and_log_events(self, innovated_mask: np.ndarray):
-        """
-        EVENT LOG — records discrete events with type, timestamp, and context.
-        Covers: event types, timestamps, state transitions, service completions.
-        """
         now = self._now()
+        _type_names = ["tastemaker", "mainstream", "niche"]
 
-        # 1. Innovation events — artist made a random creative jump
         for i in np.where(innovated_mask)[0]:
             self.event_log.append({
-                "timestamp":  now,
-                "tick":       self.t,
-                "event_type": "innovation",
-                "artist_id":  int(i),
-                "genre":      int(self.labels[i]),
-                "description": f"Artist {i} made a creative innovation in genre {self.labels[i]}",
+                "timestamp":   now,
+                "tick":        self.t,
+                "event_type":  "innovation",
+                "artist_id":   int(i),
+                "artist_type": int(self.artist_types[i]),
+                "genre":       int(self.labels[i]),
+                "description": (
+                    f"Artist {i} ({_type_names[int(self.artist_types[i])]})"
+                    f" made a creative innovation in genre {self.labels[i]}"
+                ),
             })
 
-        # 2. Genre transition events — artist moved from one genre to another
         transitions = np.where(self.labels != self._prev_labels)[0]
         for i in transitions:
             from_genre = int(self._prev_labels[i])
             to_genre   = int(self.labels[i])
             self.event_log.append({
-                "timestamp":  now,
-                "tick":       self.t,
-                "event_type": "genre_transition",
-                "artist_id":  int(i),
-                "from_genre": from_genre,
-                "to_genre":   to_genre,
-                "description": f"Artist {i} transitioned from genre {from_genre} to genre {to_genre}",
+                "timestamp":   now,
+                "tick":        self.t,
+                "event_type":  "genre_transition",
+                "artist_id":   int(i),
+                "artist_type": int(self.artist_types[i]),
+                "from_genre":  from_genre,
+                "to_genre":    to_genre,
+                "description": (
+                    f"Artist {i} ({_type_names[int(self.artist_types[i])]})"
+                    f" transitioned from genre {from_genre} to genre {to_genre}"
+                ),
             })
 
-        # 3. Genre absorption events — a genre dropped to 0 artists (service completion)
         prev_genres = set(np.unique(self._prev_labels))
         curr_genres = set(np.unique(self.labels))
-        absorbed    = prev_genres - curr_genres
-        for g in absorbed:
+
+        for g in prev_genres - curr_genres:
             self.event_log.append({
                 "timestamp":  now,
                 "tick":       self.t,
@@ -266,76 +311,61 @@ class SimulationEngine:
                 "description": f"Genre {g} was fully absorbed at tick {self.t}",
             })
 
-        # 4. Genre emergence events — a new genre appeared
-        emerged = curr_genres - prev_genres
-        for g in emerged:
+        for g in curr_genres - prev_genres:
             count = int(np.sum(self.labels == g))
             self.event_log.append({
-                "timestamp":  now,
-                "tick":       self.t,
-                "event_type": "genre_emerged",
-                "genre":      int(g),
+                "timestamp":    now,
+                "tick":         self.t,
+                "event_type":   "genre_emerged",
+                "genre":        int(g),
                 "initial_size": count,
-                "description": f"New genre {g} emerged at tick {self.t} with {count} artists",
+                "description":  f"New genre {g} emerged at tick {self.t} with {count} artists",
             })
 
     def export_summary(self) -> dict:
-        """
-        SUMMARY STATISTICS — aggregate stats across the full run.
-        Covers: averages, max/min observations, total counts, throughput.
-        """
         if not self.run_log:
             return {}
 
-        spreads      = [r["mean_style_spread"]   for r in self.run_log]
-        genres       = [r["unique_genres"]        for r in self.run_log]
-        utilizations = [r["network_utilization"]  for r in self.run_log]
-        largest      = [r["largest_genre_n"]      for r in self.run_log]
+        spreads      = [r["mean_style_spread"]  for r in self.run_log]
+        genres       = [r["unique_genres"]       for r in self.run_log]
+        utilizations = [r["network_utilization"] for r in self.run_log]
+        largest      = [r["largest_genre_n"]     for r in self.run_log]
 
-        # Throughput = total innovations per tick
         total_ticks = max(self.t, 1)
 
-        # Event type breakdown
         event_counts: dict[str, int] = {}
         for e in self.event_log:
             event_counts[e["event_type"]] = event_counts.get(e["event_type"], 0) + 1
 
+        type_counts = {
+            "n_tastemakers": int(np.sum(self.artist_types == ARTIST_TYPE_TASTEMAKER)),
+            "n_mainstream":  int(np.sum(self.artist_types == ARTIST_TYPE_MAINSTREAM)),
+            "n_niche":       int(np.sum(self.artist_types == ARTIST_TYPE_NICHE)),
+        }
+
         return {
             "run_duration_ticks":          self.t,
             "total_artists":               self.cfg.N,
-
-            # Style spread — analogous to queue length over time
+            **type_counts,
             "avg_style_spread":            round(float(np.mean(spreads)),  5),
             "max_style_spread":            round(float(np.max(spreads)),   5),
             "min_style_spread":            round(float(np.min(spreads)),   5),
-
-            # Genre counts over time
             "avg_unique_genres":           round(float(np.mean(genres)),   2),
             "max_unique_genres":           int(np.max(genres)),
             "min_unique_genres":           int(np.min(genres)),
-
-            # Dominant genre size over time
             "avg_largest_genre_n":         round(float(np.mean(largest)),  2),
             "max_largest_genre_n":         int(np.max(largest)),
             "peak_dominance_tick":         int(self.run_log[
                                                int(np.argmax(largest))
                                            ]["tick"]),
-
-            # Network utilization
             "avg_network_utilization":     round(float(np.mean(utilizations)), 5),
             "max_network_utilization":     round(float(np.max(utilizations)),  5),
-
-            # Throughput
             "total_innovations":           self._total_innovations,
             "total_genre_transitions":     self._total_genre_transitions,
             "innovation_rate_per_tick":    round(self._total_innovations     / total_ticks, 4),
             "transition_rate_per_tick":    round(self._total_genre_transitions / total_ticks, 4),
-
-            # Event breakdown
             "event_counts":                event_counts,
             "total_events":                len(self.event_log),
-
-            # Final state
             "final_unique_genres":         int(len(np.unique(self.labels))),
             "final_largest_genre_n":       int(np.bincount(self.labels).max()),
             "final_mean_style_spread":     round(float(np.mean(np.std(self.X, axis=0))), 5),
@@ -354,7 +384,6 @@ class SimulationEngine:
         cfg = self.cfg
         N, d = cfg.N, cfg.d
 
-        # Homophily-weighted influence
         diff = self.X[:, None, :] - self.X[None, :, :]
         dist = np.linalg.norm(diff, axis=-1).astype(np.float32)
         similarity = 1.0 - dist / np.sqrt(cfg.d)
@@ -365,7 +394,6 @@ class SimulationEngine:
 
         influence = W_hom @ self.X
 
-        # Innovation noise — track which artists innovated
         innovate_mask = self.rng.random(N) < cfg.p
         noise = np.where(
             innovate_mask[:, None],
@@ -376,36 +404,30 @@ class SimulationEngine:
         innovations_this_tick = int(innovate_mask.sum())
         self._total_innovations += innovations_this_tick
 
+        # Per-artist alpha — the core heterogeneity effect at each step
         a = self.alpha[:, None]
         self.X = np.clip((1 - a) * self.X + a * influence + noise, 0.0, 1.0)
         self.t += 1
 
-        # Recluster every 10 steps
         if self.t % 10 == 0:
             self._cluster_labels()
 
-        # Refresh betweenness every 50 steps
         if self.t % 50 == 0:
             self._betweenness = self._compute_betweenness()
 
-        # Count genre transitions since last tick
         genre_transitions = int(np.sum(self.labels != self._prev_labels))
         self._total_genre_transitions += genre_transitions
 
-        # Log events (innovations, transitions, absorptions, emergences)
         self._detect_and_log_events(innovate_mask)
 
-        # Network utilization this tick
         net_util = self._network_utilization(W_hom)
 
-        # Record time-series metrics
         self.run_log.append(self._collect_metrics(
             innovations_this_tick=innovations_this_tick,
             network_utilization=net_util,
             genre_transitions=genre_transitions,
         ))
 
-        # Update previous labels for next tick's transition detection
         self._prev_labels = self.labels.copy()
 
     def export_frame(self) -> dict:
@@ -414,12 +436,13 @@ class SimulationEngine:
 
         nodes = [
             {
-                "id":        int(i),
-                "group":     int(self.labels[i]),
-                "influence": float(self._betweenness[i]),
-                "x":         float(Xp[i, 0]),
-                "y":         float(Xp[i, 1]),
-                "z":         float(Xp[i, 2]) if Xp.shape[1] > 2 else 0.0,
+                "id":          int(i),
+                "group":       int(self.labels[i]),
+                "artist_type": int(self.artist_types[i]),
+                "influence":   float(self._betweenness[i]),
+                "x":           float(Xp[i, 0]),
+                "y":           float(Xp[i, 1]),
+                "z":           float(Xp[i, 2]) if Xp.shape[1] > 2 else 0.0,
             }
             for i in range(self.cfg.N)
         ]
@@ -433,9 +456,7 @@ class SimulationEngine:
         return {"t": self.t, "nodes": nodes, "links": links}
 
     def export_run_log(self) -> list[dict]:
-        """Full per-step time-series log."""
         return self.run_log
 
     def export_event_log(self) -> list[dict]:
-        """Full discrete event log."""
         return self.event_log
