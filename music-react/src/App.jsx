@@ -2,7 +2,7 @@
 import GenreStats from "./components/GenreStats.jsx";
 import ScatterPlot2D from "./components/ScatterPlot2D.jsx";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = "https://genre-evolution-simulator.onrender.com";
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 function safeArraySlice(arr, s, e) { return arr?.slice?.(s, e) ?? []; }
 const MAX_STYLE_DIM = 8;
