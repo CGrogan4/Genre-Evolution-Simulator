@@ -404,7 +404,7 @@ export default function App() {
                 }}>
                     <b>Error:</b> {error}
                     <div style={{ marginTop: 5, opacity: 0.85 }}>
-                        Make sure FastAPI is running on <code>127.0.0.1:8000</code>.
+                        Make sure FastAPI is running on <code>https://genre-evolution-simulator-front.onrender.com</code>.
                     </div>
                 </div>
             )}
